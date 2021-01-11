@@ -147,6 +147,9 @@ fullbench-dll: $(PRGDIR)/datagen.c $(PRGDIR)/util.c $(PRGDIR)/benchfn.c $(PRGDIR
 #	$(CC) $(FLAGS) $(filter %.c,$^) -o $@$(EXT) -DZSTD_DLL_IMPORT=1 $(ZSTDDIR)/dll/libzstd.dll
 	$(LINK.c) $^ $(LDLIBS) -o $@$(EXT)
 
+ldmbench : $(ZSTD_OBJECTS) ldmbench.c
+	$(LINK.c) $^ -o $@$(EXT)
+
 fuzzer : CPPFLAGS += $(MULTITHREAD_CPP)
 fuzzer : LDFLAGS += $(MULTITHREAD_LD)
 fuzzer : $(ZSTDMT_OBJECTS)
@@ -238,6 +241,7 @@ clean:
 	$(RM) -rf tmp*  # some test directories are named tmp*
 	$(RM) core *.o *.tmp result* *.gcda dictionary *.zst \
         $(PRGDIR)/zstd$(EXT) $(PRGDIR)/zstd32$(EXT) \
+        ldmbench$(EXT) \
         fullbench$(EXT) fullbench32$(EXT) \
         fullbench-lib$(EXT) fullbench-dll$(EXT) \
         fuzzer$(EXT) fuzzer32$(EXT) zbufftest$(EXT) zbufftest32$(EXT) \

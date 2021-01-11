@@ -13,6 +13,7 @@
 #include "../common/debug.h"
 #include "zstd_fast.h"          /* ZSTD_fillHashTable() */
 #include "zstd_double_fast.h"   /* ZSTD_fillDoubleHashTable() */
+#include "zstd_ldm_geartab.h"
 
 #define LDM_BUCKET_SIZE_LOG 3
 #define LDM_MIN_MATCH_LENGTH 64
@@ -303,11 +304,23 @@ static size_t ZSTD_ldm_generateSequences_internal(
         ldmEntry_t newEntry;
 
         if (ip != istart) {
+#if 0
             rollingHash = ZSTD_rollingHash_rotate(rollingHash, lastHashed[0],
                                                   lastHashed[minMatchLength],
                                                   hashPower);
+#endif
+           rollingHash <<= 1;
+           rollingHash += ZSTD_ldm_gearTab[lastHashed[minMatchLength]];
         } else {
+#if 0
             rollingHash = ZSTD_rollingHash_compute(ip, minMatchLength);
+#endif
+            unsigned i;
+
+            for (i = 0; i < minMatchLength; i++) {
+               rollingHash <<= 1;
+               rollingHash += ZSTD_ldm_gearTab[ip[i]];
+            }
         }
         lastHashed = ip;
 
