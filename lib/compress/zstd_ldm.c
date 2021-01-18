@@ -11,6 +11,7 @@
 #include "zstd_ldm.h"
 
 #include "../common/debug.h"
+#include "xxhash.h"
 #include "zstd_fast.h"          /* ZSTD_fillHashTable() */
 #include "zstd_double_fast.h"   /* ZSTD_fillDoubleHashTable() */
 #include "zstd_ldm_geartab.h"
@@ -18,6 +19,159 @@
 #define LDM_BUCKET_SIZE_LOG 3
 #define LDM_MIN_MATCH_LENGTH 64
 #define LDM_HASH_RLOG 7
+#define LDM_LOOKAHEAD_SPLITS 8
+
+typedef struct {
+    U64 lane[4];   /* rolling hash lanes */
+    int curLane;   /* current lane; can be 0, 1, 2, or 3 */
+    U64 stopMask;  /* stop as soon as the current thread matches this mask */
+} ldmRollingHashState_t;
+
+static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* params)
+{
+    memset(state, 0, sizeof(*state));
+
+    /* We want to use a mask that depends on no more and, if possible, no less
+     * than minMatchLength bytes of the input. With vanilla gear hash, bit n
+     * (0 being the lsb) depends on the (n+1) previous bytes. With the threaded
+     * gear hash implementation we use, bit n depends on no more than the 4(n+1)
+     * previous bytes. */
+    {
+        unsigned maxBitsInMask = MIN(params->minMatchLength / 4, 64);
+        unsigned minBitsInMask = params->hashRateLog;
+        U64 mask;
+
+        if (minBitsInMask > 0 && minBitsInMask <= maxBitsInMask) {
+            mask = (((U64)1 << minBitsInMask) - 1) << (maxBitsInMask - minBitsInMask);
+        } else {
+            /* In this degenerate case we choose to honor the hash rate. */
+            mask = ((U64)1 << minBitsInMask) - 1;
+        }
+        state->stopMask = mask;
+    }
+}
+
+static U64 ZSTD_ldm_gear_step(U64 lane, BYTE byte)
+{
+    return (lane << 1) + ZSTD_ldm_gearTab[byte & 0xff];
+}
+
+static int ZSTD_ldm_gear_newSplit(ldmRollingHashState_t* state, size_t* n,
+                                  int offset, U64 u0, U64 u1, U64 u2, U64 u3,
+                                  size_t* splits, unsigned* numSplits)
+{
+    splits[*numSplits] = *n + offset;
+    *numSplits += 1;
+    if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
+        state->lane[0] = u0;
+        state->lane[1] = u1;
+        state->lane[2] = u2;
+        state->lane[3] = u3;
+        *n += offset;
+        state->curLane = (state->curLane + *n) & 3;
+        return 1;
+    }
+    return 0;
+}
+
+static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
+                                 BYTE const* data, size_t size,
+                                 size_t* splits, unsigned* numSplits)
+{
+    size_t n;
+    U64 mask;
+    int l;
+
+    n = - state->curLane;
+    mask = state->stopMask;
+
+    if (n + 4 > size || mask == 0) {
+        /* In this case, the unrolled loop below cannot be safely
+         * entered: there is too little data to process.
+         * Instead, we process the data serially. */
+        n = 0;
+    } else {
+        U64 u0, u1, u2, u3;
+        U64 v0, v1, v2, v3;
+
+        u0 = state->lane[0];
+        u1 = state->lane[1];
+        u2 = state->lane[2];
+        u3 = state->lane[3];
+
+        /* Setting vi to all ones makes sure we do not register a spurious
+         * mask match below when n is non-zero. */
+        v0 = v1 = v2 = v3 = (U64)-1;
+
+        switch (-n) {
+        while (n + 4 <= size) {
+        case 0:
+            v0 = ZSTD_ldm_gear_step(u0, data[n+0]);
+            /* fallthrough */
+        case 1:
+            v1 = ZSTD_ldm_gear_step(u1, data[n+1]);
+            /* fallthrough */
+        case 2:
+            v2 = ZSTD_ldm_gear_step(u2, data[n+2]);
+            /* fallthrough */
+        case 3:
+            v3 = ZSTD_ldm_gear_step(u3, data[n+3]);
+
+            if (UNLIKELY((v0 & mask) == 0)) {
+                if (ZSTD_ldm_gear_newSplit(state, &n, 1, v0, u1, u2, u3,
+                                           splits, numSplits)) {
+                    return n;
+                }
+            }
+            if (UNLIKELY((v1 & mask) == 0)) {
+                if (ZSTD_ldm_gear_newSplit(state, &n, 2, v0, v1, u2, u3,
+                                           splits, numSplits)) {
+                    return n;
+                }
+            }
+            if (UNLIKELY((v2 & mask) == 0)) {
+                if (ZSTD_ldm_gear_newSplit(state, &n, 3, v0, v1, v2, u3,
+                                           splits, numSplits)) {
+                    return n;
+                }
+            }
+            if (UNLIKELY((v3 & mask) == 0)) {
+                if (ZSTD_ldm_gear_newSplit(state, &n, 4, v0, v1, v2, v3,
+                                           splits, numSplits)) {
+                    return n;
+                }
+            }
+
+            u0 = v0;
+            u1 = v1;
+            u2 = v2;
+            u3 = v3;
+            n += 4;
+            /* fallthrough */
+        }
+        }
+
+        state->lane[0] = u0;
+        state->lane[1] = u1;
+        state->lane[2] = u2;
+        state->lane[3] = u3;
+    }
+
+    l = (state->curLane + n) & 3;
+    while (n < size) {
+        state->lane[l] = ZSTD_ldm_gear_step(state->lane[l], data[n]);
+        n++;
+        if ((state->lane[l] & mask) == 0) {
+            splits[*numSplits] = n;
+            *numSplits += 1;
+            if (*numSplits == LDM_LOOKAHEAD_SPLITS)
+                break;
+        }
+        l = (l + 1) & 3;
+    }
+    state->curLane = l;
+    return n;
+}
 
 void ZSTD_ldm_adjustParameters(ldmParams_t* params,
                                ZSTD_compressionParameters const* cParams)
@@ -236,6 +390,7 @@ static U64 ZSTD_ldm_fillLdmHashTable(ldmState_t* state,
     return rollingHash;
 }
 
+/* TODO: See where this is used */
 void ZSTD_ldm_fillHashTable(
             ldmState_t* state, const BYTE* ip,
             const BYTE* iend, ldmParams_t const* params)
@@ -272,7 +427,149 @@ static size_t ZSTD_ldm_generateSequences_internal(
     /* LDM parameters */
     int const extDict = ZSTD_window_hasExtDict(ldmState->window);
     U32 const minMatchLength = params->minMatchLength;
-    U64 const hashPower = ldmState->hashPower;
+    U32 const entsPerBucket = 1U << params->bucketSizeLog;
+    U32 const hBits = params->hashLog - params->bucketSizeLog;
+    /* Prefix and extDict parameters */
+    U32 const dictLimit = ldmState->window.dictLimit;
+    U32 const lowestIndex = extDict ? ldmState->window.lowLimit : dictLimit;
+    BYTE const* const base = ldmState->window.base;
+    BYTE const* const dictBase = extDict ? ldmState->window.dictBase : NULL;
+    BYTE const* const dictStart = extDict ? dictBase + lowestIndex : NULL;
+    BYTE const* const dictEnd = extDict ? dictBase + dictLimit : NULL;
+    BYTE const* const lowPrefixPtr = base + dictLimit;
+    /* Input bounds */
+    BYTE const* const istart = (BYTE const*)src;
+    BYTE const* const iend = istart + srcSize;
+    BYTE const* const ilimit = iend - HASH_READ_SIZE;
+    /* Input positions */
+    BYTE const* anchor = istart;
+    BYTE const* ip = istart;
+    /* Rolling hash state */
+    ldmRollingHashState_t hashState;
+    /* Pipeline arrays */
+    size_t splits[LDM_LOOKAHEAD_SPLITS];
+    struct {
+        BYTE const* split;
+        U32 hash;
+        U32 checksum;
+        ldmEntry_t* bucket;
+    } candidates[LDM_LOOKAHEAD_SPLITS];
+    unsigned numSplits;
+
+    /* Initialize the rolling hash state with the first minMatchLength
+     * bytes */
+    ZSTD_ldm_gear_init(&hashState, params);
+    {
+        size_t n = 0;
+
+        while (n < minMatchLength) {
+            numSplits = 0;
+            n += ZSTD_ldm_gear_feed(&hashState, ip + n, minMatchLength - n,
+                                    splits, &numSplits);
+        }
+        ip += minMatchLength;
+    }
+
+    while (ip < ilimit) {
+        size_t hashed;
+        unsigned n;
+
+        numSplits = 0;
+        hashed = ZSTD_ldm_gear_feed(&hashState, ip, ilimit - ip,
+                                    splits, &numSplits);
+
+        for (n = 0; n < numSplits; n++) {
+            BYTE const* const split = ip + splits[n] - minMatchLength;
+            U64 const xxhash = XXH64(split, minMatchLength, 0);
+            U64 const hash = xxhash & ((U32)1 << hBits) - 1;
+
+            candidates[n].split = split;
+            candidates[n].hash = hash;
+            candidates[n].checksum = (U32)(xxhash >> 32);
+            candidates[n].bucket = ZSTD_ldm_getBucket(ldmState, hash, *params);
+            PREFETCH_L1(candidates[n].bucket);
+        }
+
+        for (n = 0; n < numSplits; n++) {
+            size_t forwardMatchLength = 0, backwardMatchLength = 0, bestMatchLength = 0;
+            BYTE const* const split = candidates[n].split;
+            U64 const checksum = candidates[n].checksum;
+            ldmEntry_t* const bucket = candidates[n].bucket;
+            ldmEntry_t const* cur;
+            ldmEntry_t const* bestEntry = NULL;
+
+            //if (n + 1 < numSplits)
+                //PREFETCH_L1(candidates[n + 1].bucket);
+
+            for (cur = bucket; cur < bucket + entsPerBucket; cur++) {
+                size_t curForwardMatchLength, curBackwardMatchLength,
+                       curTotalMatchLength;
+                if (cur->checksum != checksum || cur->offset <= lowestIndex) {
+                    continue;
+                }
+                if (extDict) {
+                    BYTE const* const curMatchBase =
+                        cur->offset < dictLimit ? dictBase : base;
+                    BYTE const* const pMatch = curMatchBase + cur->offset;
+                    BYTE const* const matchEnd =
+                        cur->offset < dictLimit ? dictEnd : iend;
+                    BYTE const* const lowMatchPtr =
+                        cur->offset < dictLimit ? dictStart : lowPrefixPtr;
+                    curForwardMatchLength =
+                        ZSTD_count_2segments(split, pMatch, iend, matchEnd, lowPrefixPtr);
+                    if (curForwardMatchLength < minMatchLength) {
+                        continue;
+                    }
+                    curBackwardMatchLength = ZSTD_ldm_countBackwardsMatch_2segments(
+                            split, anchor, pMatch, lowMatchPtr, dictStart, dictEnd);
+                } else { /* !extDict */
+                    BYTE const* const pMatch = base + cur->offset;
+                    curForwardMatchLength = ZSTD_count(split, pMatch, iend);
+                    if (curForwardMatchLength < minMatchLength) {
+                        continue;
+                    }
+                    curBackwardMatchLength =
+                        ZSTD_ldm_countBackwardsMatch(split, anchor, pMatch, lowPrefixPtr);
+                }
+                curTotalMatchLength = curForwardMatchLength + curBackwardMatchLength;
+
+                if (curTotalMatchLength > bestMatchLength) {
+                    bestMatchLength = curTotalMatchLength;
+                    forwardMatchLength = curForwardMatchLength;
+                    backwardMatchLength = curBackwardMatchLength;
+                    bestEntry = cur;
+                }
+            }
+
+            /* No match found -- insert an entry into the hash table
+             * and process the next split */
+            if (bestEntry == NULL) {
+                ldmEntry_t entry;
+
+                entry.offset = (U32)(split - base);
+                entry.checksum = checksum;
+                ZSTD_ldm_insertEntry(ldmState, candidates[n].hash, entry, *params);
+                continue;
+            }
+
+            /* Match! */
+        }
+
+        ip += hashed;
+    }
+
+    return iend - anchor;
+}
+
+#if 0
+static size_t ZSTD_ldm_generateSequences_internal(
+        ldmState_t* ldmState, rawSeqStore_t* rawSeqStore,
+        ldmParams_t const* params, void const* src, size_t srcSize)
+{
+    /* LDM parameters */
+    int const extDict = ZSTD_window_hasExtDict(ldmState->window);
+    U32 const minMatchLength = params->minMatchLength;
+    // U64 const hashPower = ldmState->hashPower;
     U32 const hBits = params->hashLog - params->bucketSizeLog;
     U32 const entsPerBucket = 1U << params->bucketSizeLog;
     U64 const tagMask = ZSTD_ldm_getTagMask(hBits, params->hashRateLog);
@@ -439,6 +736,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
     }
     return iend - anchor;
 }
+#endif
 
 /*! ZSTD_ldm_reduceTable() :
  *  reduce table indexes by `reducerValue` */
