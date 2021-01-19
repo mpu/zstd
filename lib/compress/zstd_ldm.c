@@ -19,9 +19,9 @@
 #define LDM_BUCKET_SIZE_LOG 3
 #define LDM_MIN_MATCH_LENGTH 64
 #define LDM_HASH_RLOG 7
-#define LDM_LOOKAHEAD_SPLITS 8
+#define LDM_LOOKAHEAD_SPLITS 16
 
-#if 0
+#if 1
 typedef struct {
     U64 rolling;
     U64 stopMask;
@@ -523,12 +523,13 @@ static size_t ZSTD_ldm_generateSequences_internal(
     {
         size_t n = 0;
 
-        while (n < minMatchLength) {
+        while (n < srcSize) {
             numSplits = 0;
-            n += ZSTD_ldm_gear_feed(&hashState, ip + n, minMatchLength - n,
+            n += ZSTD_ldm_gear_feed(&hashState, ip + n, srcSize - n,
                                     splits, &numSplits);
         }
-        ip += minMatchLength;
+        //ip += minMatchLength;
+        ip += n;
     }
 
     while (ip < ilimit) {
@@ -548,19 +549,18 @@ static size_t ZSTD_ldm_generateSequences_internal(
             candidates[n].hash = hash;
             candidates[n].checksum = (U32)(xxhash >> 32);
             candidates[n].bucket = ZSTD_ldm_getBucket(ldmState, hash, *params);
-            PREFETCH_L1(candidates[n].bucket);
+            //PREFETCH_L1(candidates[n].bucket);
+            __builtin_prefetch(candidates[n].bucket, 0, 0);
         }
 
         for (n = 0; n < numSplits; n++) {
-            size_t forwardMatchLength = 0, backwardMatchLength = 0, bestMatchLength = 0;
+            size_t forwardMatchLength = 0, backwardMatchLength = 0,
+                   bestMatchLength = 0;
             BYTE const* const split = candidates[n].split;
             U64 const checksum = candidates[n].checksum;
             ldmEntry_t* const bucket = candidates[n].bucket;
             ldmEntry_t const* cur;
             ldmEntry_t const* bestEntry = NULL;
-
-            //if (n + 1 < numSplits)
-                //PREFETCH_L1(candidates[n + 1].bucket);
 
             for (cur = bucket; cur < bucket + entsPerBucket; cur++) {
                 size_t curForwardMatchLength, curBackwardMatchLength,
