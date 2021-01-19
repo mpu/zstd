@@ -19,7 +19,7 @@
 #define LDM_BUCKET_SIZE_LOG 3
 #define LDM_MIN_MATCH_LENGTH 64
 #define LDM_HASH_RLOG 7
-#define LDM_LOOKAHEAD_SPLITS 16
+#define LDM_LOOKAHEAD_SPLITS 128
 
 #if 1
 typedef struct {
@@ -27,15 +27,15 @@ typedef struct {
     U64 stopMask;
 } ldmRollingHashState_t;
 
+typedef struct {
+    U64 rollingHash;
+    size_t position;
+} ldmSplit_t;
+
 static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* params)
 {
-    memset(state, 0, sizeof(*state));
+    state->rolling = ~(U32)0;
 
-    /* We want to use a mask that depends on no more and, if possible, no less
-     * than minMatchLength bytes of the input. With vanilla gear hash, bit n
-     * (0 being the lsb) depends on the (n+1) previous bytes. With the threaded
-     * gear hash implementation we use, bit n depends on no more than the 4(n+1)
-     * previous bytes. */
     {
         unsigned maxBitsInMask = MIN(params->minMatchLength, 64);
         unsigned minBitsInMask = params->hashRateLog;
@@ -85,7 +85,12 @@ typedef struct {
 
 static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* params)
 {
-    memset(state, 0, sizeof(*state));
+    state->lane[0] = ~(U32)0;
+    state->lane[1] = ~(U32)0;
+    state->lane[2] = ~(U32)0;
+    state->lane[3] = ~(U32)0;
+
+    state->curLane = 0;
 
     /* We want to use a mask that depends on no more and, if possible, no less
      * than minMatchLength bytes of the input. With vanilla gear hash, bit n
@@ -105,29 +110,6 @@ static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* 
         }
         state->stopMask = mask;
     }
-}
-
-static U64 ZSTD_ldm_gear_step(U64 lane, BYTE byte)
-{
-    return (lane << 1) + ZSTD_ldm_gearTab[byte & 0xff];
-}
-
-static int ZSTD_ldm_gear_newSplit(ldmRollingHashState_t* state, size_t* n,
-                                  int offset, U64 u0, U64 u1, U64 u2, U64 u3,
-                                  size_t* splits, unsigned* numSplits)
-{
-    splits[*numSplits] = *n + offset;
-    *numSplits += 1;
-    if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-        state->lane[0] = u0;
-        state->lane[1] = u1;
-        state->lane[2] = u2;
-        state->lane[3] = u3;
-        *n += offset;
-        state->curLane = (state->curLane + *n) & 3;
-        return 1;
-    }
-    return 0;
 }
 
 static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
@@ -151,18 +133,12 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
         u2 = state->lane[(l + 2) & 3];
         u3 = state->lane[(l + 3) & 3];
 
-        while (n + 4 <= size) {
-            v0 = data[n+0] & 0xff;
-            v1 = data[n+1] & 0xff;
-            v2 = data[n+2] & 0xff;
-            v3 = data[n+3] & 0xff;
+        do {
+            u0 = (u0 << 1) + ZSTD_ldm_gearTab[data[n+0] & 0xff];
+            u1 = (u1 << 1) + ZSTD_ldm_gearTab[data[n+1] & 0xff];
+            u2 = (u2 << 1) + ZSTD_ldm_gearTab[data[n+2] & 0xff];
+            u3 = (u3 << 1) + ZSTD_ldm_gearTab[data[n+3] & 0xff];
 
-            v0 = ZSTD_ldm_gearTab[v0];
-            v1 = ZSTD_ldm_gearTab[v1];
-            v2 = ZSTD_ldm_gearTab[v2];
-            v3 = ZSTD_ldm_gearTab[v3];
-
-            u0 = (u0 << 1) + v0;
             if (UNLIKELY((u0 & mask) == 0)) {
                 splits[*numSplits] = n + 1;
                 *numSplits += 1;
@@ -172,7 +148,6 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
                 }
             }
 
-            u1 = (u1 << 1) + v1;
             if (UNLIKELY((u1 & mask) == 0)) {
                 splits[*numSplits] = n + 2;
                 *numSplits += 1;
@@ -182,7 +157,6 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
                 }
             }
 
-            u2 = (u2 << 1) + v2;
             if (UNLIKELY((u2 & mask) == 0)) {
                 splits[*numSplits] = n + 3;
                 *numSplits += 1;
@@ -192,7 +166,6 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
                 }
             }
 
-            u3 = (u3 << 1) + v3;
             if (UNLIKELY((u3 & mask) == 0)) {
                 splits[*numSplits] = n + 4;
                 *numSplits += 1;
@@ -203,7 +176,7 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
             }
 
             n += 4;
-        }
+        } while (n + 4 <= size);
 
         state->lane[(l + 0) & 3] = u0;
         state->lane[(l + 1) & 3] = u1;
@@ -219,7 +192,7 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
     }
 
     while (n < size) {
-        state->lane[l] = ZSTD_ldm_gear_step(state->lane[l], data[n]);
+        state->lane[l] = (state->lane[l] << 1) + ZSTD_ldm_gearTab[data[n] & 0xff];
         n++;
         if ((state->lane[l] & mask) == 0) {
             splits[*numSplits] = n;
@@ -523,13 +496,12 @@ static size_t ZSTD_ldm_generateSequences_internal(
     {
         size_t n = 0;
 
-        while (n < srcSize) {
+        while (n < minMatchLength) {
             numSplits = 0;
-            n += ZSTD_ldm_gear_feed(&hashState, ip + n, srcSize - n,
+            n += ZSTD_ldm_gear_feed(&hashState, ip + n, minMatchLength - n,
                                     splits, &numSplits);
         }
-        //ip += minMatchLength;
-        ip += n;
+        ip += minMatchLength;
     }
 
     while (ip < ilimit) {
@@ -543,14 +515,12 @@ static size_t ZSTD_ldm_generateSequences_internal(
         for (n = 0; n < numSplits; n++) {
             BYTE const* const split = ip + splits[n] - minMatchLength;
             U64 const xxhash = XXH64(split, minMatchLength, 0);
-            U64 const hash = xxhash & ((U32)1 << hBits) - 1;
+            U64 const hash = xxhash & (((U32)1 << hBits) - 1);
 
             candidates[n].split = split;
             candidates[n].hash = hash;
             candidates[n].checksum = (U32)(xxhash >> 32);
             candidates[n].bucket = ZSTD_ldm_getBucket(ldmState, hash, *params);
-            //PREFETCH_L1(candidates[n].bucket);
-            __builtin_prefetch(candidates[n].bucket, 0, 0);
         }
 
         for (n = 0; n < numSplits; n++) {
