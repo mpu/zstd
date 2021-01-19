@@ -19,7 +19,7 @@
 #define LDM_BUCKET_SIZE_LOG 3
 #define LDM_MIN_MATCH_LENGTH 64
 #define LDM_HASH_RLOG 7
-#define LDM_LOOKAHEAD_SPLITS 128
+#define LDM_LOOKAHEAD_SPLITS 64
 
 #if 1
 typedef struct {
@@ -56,22 +56,37 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
                                  size_t* splits, unsigned* numSplits)
 {
     size_t n;
-    U64 rolling, mask;
+    U64 hash, mask;
 
-    rolling = state->rolling;
+    hash = state->rolling;
     mask = state->stopMask;
-    for (n = 0; n < size;) {
-        rolling <<= 1;
-        rolling += ZSTD_ldm_gearTab[data[n] & 0xff];
-        n += 1;
-        if (UNLIKELY((rolling & mask) == 0)) {
-            splits[*numSplits] = n;
-            *numSplits += 1;
-            if (*numSplits == LDM_LOOKAHEAD_SPLITS)
-                break;
-        }
+    n = 0;
+
+#define GEAR_ITER_ONCE() do { \
+        hash = (hash << 1) + ZSTD_ldm_gearTab[data[n] & 0xff]; \
+        n += 1; \
+        if (UNLIKELY((hash & mask) == 0)) { \
+            splits[*numSplits] = n; \
+            *numSplits += 1; \
+            if (*numSplits == LDM_LOOKAHEAD_SPLITS) \
+                goto done; \
+        } \
+    } while (0)
+
+    while (n + 3 < size) {
+        GEAR_ITER_ONCE();
+        GEAR_ITER_ONCE();
+        GEAR_ITER_ONCE();
+        GEAR_ITER_ONCE();
     }
-    state->rolling = rolling;
+    while (n < size) {
+        GEAR_ITER_ONCE();
+    }
+
+#undef GEAR_ITER_ONCE
+
+done:
+    state->rolling = hash;
     return n;
 }
 
