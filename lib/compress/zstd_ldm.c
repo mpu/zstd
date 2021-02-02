@@ -21,16 +21,10 @@
 #define LDM_HASH_RLOG 7
 #define LDM_LOOKAHEAD_SPLITS 64
 
-#if 1
 typedef struct {
     U64 rolling;
     U64 stopMask;
 } ldmRollingHashState_t;
-
-typedef struct {
-    U64 rollingHash;
-    size_t position;
-} ldmSplit_t;
 
 static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* params)
 {
@@ -89,138 +83,6 @@ done:
     state->rolling = hash;
     return n;
 }
-
-#else
-
-typedef struct {
-    U64 lane[4];       /* rolling hash lanes */
-    unsigned curLane;  /* current lane; can be 0, 1, 2, or 3 */
-    U64 stopMask;      /* stop as soon as the current thread matches this mask */
-} ldmRollingHashState_t;
-
-static void ZSTD_ldm_gear_init(ldmRollingHashState_t* state, ldmParams_t const* params)
-{
-    state->lane[0] = ~(U32)0;
-    state->lane[1] = ~(U32)0;
-    state->lane[2] = ~(U32)0;
-    state->lane[3] = ~(U32)0;
-
-    state->curLane = 0;
-
-    /* We want to use a mask that depends on no more and, if possible, no less
-     * than minMatchLength bytes of the input. With vanilla gear hash, bit n
-     * (0 being the lsb) depends on the (n+1) previous bytes. With the threaded
-     * gear hash implementation we use, bit n depends on no more than the 4(n+1)
-     * previous bytes. */
-    {
-        unsigned maxBitsInMask = MIN(params->minMatchLength / 4, 64);
-        unsigned minBitsInMask = params->hashRateLog;
-        U64 mask;
-
-        if (minBitsInMask > 0 && minBitsInMask <= maxBitsInMask) {
-            mask = (((U64)1 << minBitsInMask) - 1) << (maxBitsInMask - minBitsInMask);
-        } else {
-            /* In this degenerate case we choose to honor the hash rate. */
-            mask = ((U64)1 << minBitsInMask) - 1;
-        }
-        state->stopMask = mask;
-    }
-}
-
-static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
-                                 BYTE const* data, size_t size,
-                                 size_t* splits, unsigned* numSplits)
-{
-    size_t n;
-    U64 mask;
-    unsigned l;
-
-    l = state->curLane;
-    mask = state->stopMask;
-    n = 0;
-
-    if (size > 4) {
-        U64 u0, u1, u2, u3;
-        U64 v0, v1, v2, v3;
-
-        u0 = state->lane[(l + 0) & 3];
-        u1 = state->lane[(l + 1) & 3];
-        u2 = state->lane[(l + 2) & 3];
-        u3 = state->lane[(l + 3) & 3];
-
-        do {
-            u0 = (u0 << 1) + ZSTD_ldm_gearTab[data[n+0] & 0xff];
-            u1 = (u1 << 1) + ZSTD_ldm_gearTab[data[n+1] & 0xff];
-            u2 = (u2 << 1) + ZSTD_ldm_gearTab[data[n+2] & 0xff];
-            u3 = (u3 << 1) + ZSTD_ldm_gearTab[data[n+3] & 0xff];
-
-            if (UNLIKELY((u0 & mask) == 0)) {
-                splits[*numSplits] = n + 1;
-                *numSplits += 1;
-                if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-                    n += 1;
-                    break;
-                }
-            }
-
-            if (UNLIKELY((u1 & mask) == 0)) {
-                splits[*numSplits] = n + 2;
-                *numSplits += 1;
-                if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-                    n += 2;
-                    break;
-                }
-            }
-
-            if (UNLIKELY((u2 & mask) == 0)) {
-                splits[*numSplits] = n + 3;
-                *numSplits += 1;
-                if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-                    n += 3;
-                    break;
-                }
-            }
-
-            if (UNLIKELY((u3 & mask) == 0)) {
-                splits[*numSplits] = n + 4;
-                *numSplits += 1;
-                if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-                    n += 4;
-                    break;
-                }
-            }
-
-            n += 4;
-        } while (n + 4 <= size);
-
-        state->lane[(l + 0) & 3] = u0;
-        state->lane[(l + 1) & 3] = u1;
-        state->lane[(l + 2) & 3] = u2;
-        state->lane[(l + 3) & 3] = u3;
-
-        if (*numSplits == LDM_LOOKAHEAD_SPLITS) {
-            state->curLane = (l + n) & 3;
-            return n;
-        }
-
-        assert(l == ((l + n) & 3));
-    }
-
-    while (n < size) {
-        state->lane[l] = (state->lane[l] << 1) + ZSTD_ldm_gearTab[data[n] & 0xff];
-        n++;
-        if ((state->lane[l] & mask) == 0) {
-            splits[*numSplits] = n;
-            *numSplits += 1;
-            if (*numSplits == LDM_LOOKAHEAD_SPLITS)
-                break;
-        }
-        l = (l + 1) & 3;
-    }
-    state->curLane = l;
-    return n;
-}
-#endif
 
 void ZSTD_ldm_adjustParameters(ldmParams_t* params,
                                ZSTD_compressionParameters const* cParams)
