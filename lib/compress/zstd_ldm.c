@@ -367,8 +367,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
     } candidates[LDM_LOOKAHEAD_SPLITS];
     unsigned numSplits;
 
-    /* Initialize the rolling hash state with the first minMatchLength
-     * bytes */
+    /* Initialize the rolling hash state with the first minMatchLength bytes */
     ZSTD_ldm_gear_init(&hashState, params);
     {
         size_t n = 0;
@@ -398,6 +397,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
             candidates[n].hash = hash;
             candidates[n].checksum = (U32)(xxhash >> 32);
             candidates[n].bucket = ZSTD_ldm_getBucket(ldmState, hash, *params);
+            PREFETCH_L1(candidates[n].bucket);
         }
 
         for (n = 0; n < numSplits; n++) {
