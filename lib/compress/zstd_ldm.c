@@ -16,9 +16,9 @@
 #include "zstd_double_fast.h"   /* ZSTD_fillDoubleHashTable() */
 #include "zstd_ldm_geartab.h"
 
-#define LDM_BUCKET_SIZE_LOG 3
+#define LDM_BUCKET_SIZE_LOG 2
 #define LDM_MIN_MATCH_LENGTH 64
-#define LDM_HASH_RLOG 7
+#define LDM_HASH_RLOG 8
 #define LDM_LOOKAHEAD_SPLITS 64
 
 typedef struct {
@@ -67,7 +67,7 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
         } \
     } while (0)
 
-    while (0 && n + 3 < size) {
+    while (n + 3 < size) {
         GEAR_ITER_ONCE();
         GEAR_ITER_ONCE();
         GEAR_ITER_ONCE();
@@ -296,7 +296,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
     BYTE const* ip = istart;
     /* Rolling hash state */
     ldmRollingHashState_t hashState;
-    /* Pipeline arrays */
+    /* Arrays for staged-processing */
     size_t splits[LDM_LOOKAHEAD_SPLITS];
     struct {
         BYTE const* split;
