@@ -230,6 +230,7 @@ void ZSTD_ldm_fillHashTable(
 
     DEBUGLOG(5, "ZSTD_ldm_fillHashTable");
 
+    ZSTD_ldm_gear_init(&hashState, params);
     while (ip < iend) {
         size_t hashed;
         unsigned n;
