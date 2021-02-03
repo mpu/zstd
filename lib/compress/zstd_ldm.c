@@ -406,6 +406,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
                    bestMatchLength = 0, mLength;
             BYTE const* const split = candidates[n].split;
             U64 const checksum = candidates[n].checksum;
+	    U64 const hash = candidates[n].hash;
             ldmEntry_t* const bucket = candidates[n].bucket;
             ldmEntry_t const* cur;
             ldmEntry_t const* bestEntry = NULL;
@@ -418,7 +419,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
              * the previous one, we merely register it in the hash table and
              * move on */
             if (split < anchor) {
-                ZSTD_ldm_insertEntry(ldmState, candidates[n].hash, newEntry, *params);
+                ZSTD_ldm_insertEntry(ldmState, hash, newEntry, *params);
                 continue;
             }
 
@@ -465,21 +466,20 @@ static size_t ZSTD_ldm_generateSequences_internal(
             /* No match found -- insert an entry into the hash table
              * and process the next candidate match */
             if (bestEntry == NULL) {
-                ZSTD_ldm_insertEntry(ldmState, candidates[n].hash, newEntry, *params);
+                ZSTD_ldm_insertEntry(ldmState, hash, newEntry, *params);
                 continue;
             }
 
             /* Match found */
             mLength = forwardMatchLength + backwardMatchLength;
             {
-                BYTE const* const match = split - backwardMatchLength;
-                U32 const offset = (U32)(match - base) - bestEntry->offset;
+                U32 const offset = (U32)(split - base) - bestEntry->offset;
                 rawSeq* const seq = rawSeqStore->seq + rawSeqStore->size;
 
                 /* Out of sequence storage */
                 if (rawSeqStore->size == rawSeqStore->capacity)
                     return ERROR(dstSize_tooSmall);
-                seq->litLength = (U32)(match - anchor);
+                seq->litLength = (U32)(split - backwardMatchLength - anchor);
                 seq->matchLength = (U32)mLength;
                 seq->offset = offset;
                 rawSeqStore->size++;
@@ -487,7 +487,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
 
             /* Insert the current entry into the hash table --- it must be
              * done after the previous block to avoid clobbering bestEntry */
-            ZSTD_ldm_insertEntry(ldmState, candidates[n].hash, newEntry, *params);
+            ZSTD_ldm_insertEntry(ldmState, hash, newEntry, *params);
 
             anchor = split + forwardMatchLength;
         }
