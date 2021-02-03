@@ -67,7 +67,7 @@ static size_t ZSTD_ldm_gear_feed(ldmRollingHashState_t* state,
         } \
     } while (0)
 
-    while (n + 3 < size) {
+    while (0 && n + 3 < size) {
         GEAR_ITER_ONCE();
         GEAR_ITER_ONCE();
         GEAR_ITER_ONCE();
@@ -119,38 +119,6 @@ size_t ZSTD_ldm_getMaxNbSeq(ldmParams_t params, size_t maxChunkSize)
     return params.enableLdm ? (maxChunkSize / params.minMatchLength) : 0;
 }
 
-/** ZSTD_ldm_getSmallHash() :
- *  numBits should be <= 32
- *  If numBits==0, returns 0.
- *  @return : the most significant numBits of hash. */
-static U32 ZSTD_ldm_getSmallHash(U64 hash, U32 numBits)
-{
-    assert(numBits <= 32);
-    return numBits == 0 ? 0 : (U32)(hash >> (64 - numBits));
-}
-
-/** ZSTD_ldm_getChecksum() :
- *  numBitsToDiscard should be <= 32
- *  @return : the next most significant 32 bits after numBitsToDiscard */
-static U32 ZSTD_ldm_getChecksum(U64 hash, U32 numBitsToDiscard)
-{
-    assert(numBitsToDiscard <= 32);
-    return (hash >> (64 - (32 + numBitsToDiscard))) & 0xFFFFFFFF;
-}
-
-/** ZSTD_ldm_getTagMask() :
- *  Returns the mask against which the rolling hash must be
- *  checked. */
-static U64 ZSTD_ldm_getTagMask(U32 hbits, U32 hashRateLog)
-{
-    assert(hashRateLog < 32 && hbits <= 32);
-    if (32 - hbits < hashRateLog) {
-        return (((U64)1 << hashRateLog) - 1);
-    } else {
-        return (((U64)1 << hashRateLog) - 1) << (32 - hbits - hashRateLog);
-    }
-}
-
 /** ZSTD_ldm_getBucket() :
  *  Returns a pointer to the start of the bucket associated with hash. */
 static ldmEntry_t* ZSTD_ldm_getBucket(
@@ -171,33 +139,6 @@ static void ZSTD_ldm_insertEntry(ldmState_t* ldmState,
     *(ZSTD_ldm_getBucket(ldmState, hash, ldmParams) + offset) = entry;
     *pOffset = (BYTE)((offset + 1) & ((1u << ldmParams.bucketSizeLog) - 1));
 
-}
-
-/** ZSTD_ldm_makeEntryAndInsertByTag() :
- *
- *  Gets the small hash, checksum, and tag from the rollingHash.
- *
- *  If the tag matches (1 << ldmParams.hashRateLog)-1, then
- *  creates an ldmEntry from the offset, and inserts it into the hash table.
- *
- *  hBits is the length of the small hash, which is the most significant hBits
- *  of rollingHash. The checksum is the next 32 most significant bits, followed
- *  by ldmParams.hashRateLog bits that make up the tag. */
-static void ZSTD_ldm_makeEntryAndInsertByTag(ldmState_t* ldmState,
-                                             U64 const rollingHash,
-                                             U32 const hBits,
-                                             U32 const offset,
-                                             ldmParams_t const ldmParams)
-{
-    U64 const tagMask = ZSTD_ldm_getTagMask(hBits, ldmParams.hashRateLog);
-    if ((rollingHash & tagMask) == tagMask) {
-        U32 const hash = ZSTD_ldm_getSmallHash(rollingHash, hBits);
-        U32 const checksum = ZSTD_ldm_getChecksum(rollingHash, hBits);
-        ldmEntry_t entry;
-        entry.offset = offset;
-        entry.checksum = checksum;
-        ZSTD_ldm_insertEntry(ldmState, hash, entry, ldmParams);
-    }
 }
 
 /** ZSTD_ldm_countBackwardsMatch() :
@@ -275,45 +216,41 @@ static size_t ZSTD_ldm_fillFastTables(ZSTD_matchState_t* ms,
     return 0;
 }
 
-/** ZSTD_ldm_fillLdmHashTable() :
- *
- *  Fills hashTable from (lastHashed + 1) to iend (non-inclusive).
- *  lastHash is the rolling hash that corresponds to lastHashed.
- *
- *  Returns the rolling hash corresponding to position iend-1. */
-static U64 ZSTD_ldm_fillLdmHashTable(ldmState_t* state,
-                                     U64 lastHash, const BYTE* lastHashed,
-                                     const BYTE* iend, const BYTE* base,
-                                     U32 hBits, ldmParams_t const ldmParams)
-{
-    U64 rollingHash = lastHash;
-    const BYTE* cur = lastHashed + 1;
-
-    while (cur < iend) {
-        rollingHash = ZSTD_rollingHash_rotate(rollingHash, cur[-1],
-                                              cur[ldmParams.minMatchLength-1],
-                                              state->hashPower);
-        ZSTD_ldm_makeEntryAndInsertByTag(state,
-                                         rollingHash, hBits,
-                                         (U32)(cur - base), ldmParams);
-        ++cur;
-    }
-    return rollingHash;
-}
-
-/* TODO: See where this is used.
- * It is used when loading a dictionary */
 void ZSTD_ldm_fillHashTable(
-            ldmState_t* state, const BYTE* ip,
+            ldmState_t* ldmState, const BYTE* ip,
             const BYTE* iend, ldmParams_t const* params)
 {
+    U32 const minMatchLength = params->minMatchLength;
+    U32 const hBits = params->hashLog - params->bucketSizeLog;
+    BYTE const* const base = ldmState->window.base;
+    BYTE const* const istart = ip;
+    ldmRollingHashState_t hashState;
+    size_t splits[LDM_LOOKAHEAD_SPLITS];
+    unsigned numSplits;
+
     DEBUGLOG(5, "ZSTD_ldm_fillHashTable");
-    if ((size_t)(iend - ip) >= params->minMatchLength) {
-        U64 startingHash = ZSTD_rollingHash_compute(ip, params->minMatchLength);
-        ZSTD_ldm_fillLdmHashTable(
-            state, startingHash, ip, iend - params->minMatchLength, state->window.base,
-            params->hashLog - params->bucketSizeLog,
-            *params);
+
+    while (ip < iend) {
+        size_t hashed;
+        unsigned n;
+        
+        numSplits = 0;
+        hashed = ZSTD_ldm_gear_feed(&hashState, ip, iend - ip, splits, &numSplits);
+
+        for (n = 0; n < numSplits; n++) {
+            if (ip + splits[n] >= istart + minMatchLength) {
+                BYTE const* const split = ip + splits[n] - minMatchLength;
+                U64 const xxhash = XXH64(split, minMatchLength, 0);
+                U64 const hash = xxhash & (((U32)1 << hBits) - 1);
+                ldmEntry_t entry;
+
+                entry.offset = (U32)(split - base);
+                entry.checksum = (U32)(xxhash >> 32);
+                ZSTD_ldm_insertEntry(ldmState, hash, entry, *params);
+            }
+        }
+
+        ip += hashed;
     }
 }
 
